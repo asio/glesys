@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -181,8 +182,12 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 // In RFC 9499 terms, SetRecords appends, modifies, or deletes records in the
 // zone so that for each RRset in the input, the records provided in the input
 // are the only members of their RRset in the output zone.
-// Calls to SetRecords are presumed to be atomic;
-// It returns the updated records.
+//
+// An RRset is matched on name and type only: existing members with other data
+// or TTL are updated in place (keeping their record ID), surplus members are
+// deleted and missing ones added. The GleSYS API has no transactions, so a
+// failure part-way leaves the changes made so far.
+// It returns the records now in the zone for the input RRsets.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
@@ -191,165 +196,102 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 		log.Printf("SetRecords zone=%s", zone)
 	}
 
-	type updateChange struct {
-		From impl.DNSDomainRecord
-		To   impl.DNSDomainRecord
-	}
-
-	type changes struct {
-		updates   []updateChange
-		deletes   []impl.DNSDomainRecord
-		additions []impl.DNSDomainRecord
-	}
-
-	wanted := changes{
-		updates:   []updateChange{},
-		deletes:   []impl.DNSDomainRecord{},
-		additions: []impl.DNSDomainRecord{},
-	}
-	executed := changes{
-		updates:   []updateChange{},
-		deletes:   []impl.DNSDomainRecord{},
-		additions: []impl.DNSDomainRecord{},
-	}
-
-	makeAfter := func(inErr error) ([]libdns.Record, error) {
-		if inErr != nil {
-			// revert the changes
-			for _, dr := range wanted.deletes {
-				// add the record back
-				param := impl.AddRecordParams{
-					DomainName: zone,
-					Host:       dr.Host,
-					Data:       dr.Data,
-					TTL:        dr.TTL,
-					Type:       strings.ToUpper(dr.Type),
-				}
-				_, err := p.client().DNSDomains.AddRecord(ctx, param)
-				if err != nil {
-					return nil, err
-				}
-			}
-			for _, dr := range wanted.updates {
-				// update the record back
-				param := impl.UpdateRecordParams{
-					RecordID: dr.From.RecordID,
-					Host:     dr.From.Host,
-					Data:     dr.From.Data,
-					TTL:      dr.From.TTL,
-					Type:     strings.ToUpper(dr.From.Type),
-				}
-				_, err := p.client().DNSDomains.UpdateRecord(ctx, param)
-				if err != nil {
-					return nil, err
-				}
-			}
-			for _, dr := range wanted.additions {
-				// delete the record
-				err := p.client().DNSDomains.DeleteRecord(ctx, dr.RecordID)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return nil, inErr
-		}
-		after := []libdns.Record{}
-		for _, dr := range wanted.additions {
-			after = append(after, mustToLibDNS(&dr))
-		}
-		for _, dr := range wanted.updates {
-			after = append(after, mustToLibDNS(&dr.To))
-		}
-		return after, nil
-	}
-
-	// find the records that need to be updated or deleted
-	matching, err := p.getMatchingRecords(ctx, zone, records)
+	existing, err := p.client().DNSDomains.ListRecords(ctx, zone)
 	if err != nil {
-		return makeAfter(err)
+		return nil, err
 	}
-	for _, m := range matching {
-		if len(m.Matches) == 0 {
-			// no matches, record needs to be added
-			wanted.additions = append(wanted.additions, impl.DNSDomainRecord{
-				DomainName: zone,
-				Host:       m.Record.RR().Name,
-				Data:       m.Record.RR().Data,
-				TTL:        int(m.Record.RR().TTL / time.Second),
-				Type:       strings.ToUpper(m.Record.RR().Type),
-			})
-			continue
+
+	// group the input by RRset, keeping the input order
+	type rrset struct {
+		name, typ string
+		wanted    []libdns.RR
+	}
+	sets := []*rrset{}
+	byKey := map[string]*rrset{}
+	for _, r := range records {
+		rr := r.RR()
+		typ := strings.ToUpper(rr.Type)
+		key := rr.Name + " " + typ
+		s, ok := byKey[key]
+		if !ok {
+			s = &rrset{name: rr.Name, typ: typ}
+			byKey[key] = s
+			sets = append(sets, s)
 		}
-		for _, dr := range m.Matches {
-			if dr.Type == m.Record.RR().Type && dr.Host == m.Record.RR().Name && dr.Data == m.Record.RR().Data && dr.TTL == int(m.Record.RR().TTL/time.Second) {
-				// record already exists, no need to update
+		s.wanted = append(s.wanted, rr)
+	}
+
+	result := []libdns.Record{}
+	for _, s := range sets {
+		current := []impl.DNSDomainRecord{}
+		for _, dr := range *existing {
+			if dr.Host == s.name && strings.ToUpper(dr.Type) == s.typ {
+				current = append(current, dr)
+			}
+		}
+
+		// members already as wanted stay untouched
+		todo := []libdns.RR{}
+		for _, rr := range s.wanted {
+			i := slices.IndexFunc(current, func(dr impl.DNSDomainRecord) bool {
+				return dr.Data == rr.Data && (rr.TTL == 0 || rr.TTL == time.Duration(dr.TTL)*time.Second)
+			})
+			if i < 0 {
+				todo = append(todo, rr)
 				continue
 			}
-			// record needs to be updated
-			wanted.updates = append(wanted.updates, updateChange{
-				From: dr,
-				To: impl.DNSDomainRecord{
-					DomainName: dr.DomainName,
-					RecordID:   dr.RecordID,
-					Host:       dr.Host,
-					Data:       m.Record.RR().Data,
-					TTL:        int(m.Record.RR().TTL / time.Second),
-					Type:       strings.ToUpper(m.Record.RR().Type),
-				},
-			})
+			result = append(result, mustToLibDNS(&current[i]))
+			current = slices.Delete(current, i, i+1)
 		}
-		// record needs to be deleted
-		wanted.deletes = append(wanted.deletes, m.Matches...)
 
-	}
+		// reuse the remaining members for the rest, add when none are left
+		for _, rr := range todo {
+			ttl := int(rr.TTL / time.Second)
+			if len(current) > 0 {
+				dr := current[0]
+				current = current[1:]
+				_, err := p.client().DNSDomains.UpdateRecord(ctx, impl.UpdateRecordParams{
+					RecordID: dr.RecordID,
+					Host:     s.name,
+					Data:     rr.Data,
+					TTL:      ttl,
+					Type:     s.typ,
+				})
+				if err != nil {
+					return result, err
+				}
+				if ttl == 0 {
+					ttl = dr.TTL
+				}
+			} else {
+				_, err := p.client().DNSDomains.AddRecord(ctx, impl.AddRecordParams{
+					DomainName: zone,
+					Host:       s.name,
+					Data:       rr.Data,
+					TTL:        ttl,
+					Type:       s.typ,
+				})
+				if err != nil {
+					return result, err
+				}
+			}
+			result = append(result, mustToLibDNS(&impl.DNSDomainRecord{
+				DomainName: zone,
+				Host:       s.name,
+				Data:       rr.Data,
+				TTL:        ttl,
+				Type:       s.typ,
+			}))
+		}
 
-	// changes needs to be atomic so in case of failure we need to
-	// revert the changes
-	// we need to delete the records that are not in the wanted list
-
-	// delete the records that need to be deleted
-	for _, dr := range wanted.deletes {
-		err = p.client().DNSDomains.DeleteRecord(ctx, dr.RecordID)
-		if err != nil {
-			return makeAfter(err)
+		// members not in the input leave the RRset
+		for _, dr := range current {
+			if err := p.client().DNSDomains.DeleteRecord(ctx, dr.RecordID); err != nil {
+				return result, err
+			}
 		}
-		executed.deletes = append(executed.deletes, dr)
 	}
-	// update the records that need to be updated
-	for _, dr := range wanted.updates {
-		param := impl.UpdateRecordParams{
-			RecordID: dr.From.RecordID,
-			Host:     dr.To.Host,
-			Data:     dr.To.Data,
-			TTL:      dr.To.TTL,
-			Type:     strings.ToUpper(dr.To.Type),
-		}
-		_, err = p.client().DNSDomains.UpdateRecord(ctx, param)
-		if err != nil {
-			return makeAfter(err)
-		}
-		executed.updates = append(executed.updates, updateChange{
-			From: dr.From,
-			To:   dr.To,
-		})
-	}
-	// add the records that need to be added
-	for _, dr := range wanted.additions {
-		param := impl.AddRecordParams{
-			DomainName: zone,
-			Host:       dr.Host,
-			Data:       dr.Data,
-			TTL:        dr.TTL,
-			Type:       strings.ToUpper(dr.Type),
-		}
-		dr, err := p.client().DNSDomains.AddRecord(ctx, param)
-		if err != nil {
-			return makeAfter(err)
-		}
-		executed.additions = append(executed.additions, *dr)
-	}
-
-	return makeAfter(nil)
+	return result, nil
 }
 
 // DeleteRecords deletes the records from the zone. It returns the records that were deleted.
